@@ -1007,6 +1007,7 @@ def createfourierdesignmatrix_physicalephem(
     Parameters can be excluded by setting the corresponding prior sigma to None
 
     :param toas:             vector of time series in seconds
+    :param planetssb:        Planetary position vectors at all timestamps
     :param pos:              pulsar position as Cartesian vector
     :param frame_drift_rate: normal sigma for frame drift rate
     :param d_jupiter_mass:   normal sigma for Jupiter mass perturbation
