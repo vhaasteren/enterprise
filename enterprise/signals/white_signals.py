@@ -197,7 +197,7 @@ def EcorrKernelNoise(
         logger.warning(msg)
         fsm_warning_issued = True
 
-    class EcorrKernelNoise(signal_base.Signal):
+    class EcorrKernelNoise_(signal_base.Signal):
         signal_type = "white noise"
         signal_name = "ecorr_" + method
         signal_id = "_".join(["ecorr", name, method]) if name else "_".join(["ecorr", method])
