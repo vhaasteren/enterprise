@@ -29,6 +29,7 @@ def _sample(parlist, parvalues):
 
     for par in parlist:
         if par not in parvalues:
+            # RvH: Hyper pars seem to be broken
             # sample hyperpars for this par, skip parameter itself
             parvalues.update(sample(par.params[1:]))
 
@@ -58,6 +59,7 @@ class Parameter(object):
         self.type = self.__class__.__name__.lower()
 
     def get_logpdf(self, value=None, **kwargs):
+        # RvH: This exception cannot be triggered
         if not isinstance(self, Parameter):
             raise TypeError("You can only call get_logpdf() on an " "instantiated (named) Parameter.")
 
@@ -72,6 +74,7 @@ class Parameter(object):
         return logpdf if self._size is None else np.sum(logpdf)
 
     def get_pdf(self, value=None, **kwargs):
+        # RvH: This exception cannot be triggered
         if not isinstance(self, Parameter):
             raise TypeError("You can only call get_pdf() on an " "instantiated (named) Parameter.")
 
@@ -93,6 +96,7 @@ class Parameter(object):
             raise AttributeError("No sampler was provided for this Parameter.")
         else:
             if self.name in kwargs:
+                # RvH: This exception cannot be triggered
                 raise ValueError("You shouldn't give me my value when you're sampling me.!")
 
             if hasattr(self, "prior"):
@@ -101,9 +105,6 @@ class Parameter(object):
                 return self.logprior(func=self._sampler, size=self._size, **kwargs)
 
     def get_ppf(self, value=None, **kwargs):
-        if not isinstance(self, Parameter):
-            raise TypeError("You can only call get_pdf() on an " "instantiated (named) Parameter.")
-
         if self.ppf is None:
             raise NotImplementedError("No ppf was implemented for this Parameter.")
 
@@ -266,7 +267,7 @@ def NormalPPF(value, mu, sigma):
     Handles scalar mu and sigma, compatible vector value/mu/sigma,
     vector value/mu and compatible covariance matrix sigma."""
 
-    if np.ndim(sigma) == 2:
+    if np.ndim(sigma) >= 2:
         raise NotImplementedError("PPF not implemented when sigma is 2D")
 
     return sstats.norm.ppf(value, loc=mu, scale=sigma)

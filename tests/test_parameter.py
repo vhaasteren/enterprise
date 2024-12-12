@@ -13,10 +13,53 @@ import unittest
 import numpy as np
 import scipy.stats
 
+from enterprise.signals.parameter import Parameter, UserParameter, Function
 from enterprise.signals.parameter import UniformPrior, UniformSampler, Uniform, UniformPPF
 from enterprise.signals.parameter import NormalPrior, NormalSampler, Normal, NormalPPF
 from enterprise.signals.parameter import TruncNormalPrior, TruncNormalSampler, TruncNormal
-from enterprise.signals.parameter import LinearExpPrior, LinearExpSampler, LinearExpPPF
+from enterprise.signals.parameter import LinearExpPrior, LinearExpSampler, LinearExpPPF, LinearExp
+
+
+class TestParameterExceptions(unittest.TestCase):
+    def test_missing_prior_attribute_error(self):
+        class MissingPriorParameter(Parameter):
+            pass  # Do not define _prior or _logprior
+
+        with self.assertRaises(AttributeError):
+            MissingPriorParameter("test")
+
+    def test_methods_called_on_class_type_error(self):
+        UniformClass = Uniform(pmin=0, pmax=1)
+        with self.assertRaises(TypeError):
+            UniformClass.get_logpdf()
+
+    def test_missing_sampler_attribute_error(self):
+        class MissingSamplerParameter(Parameter):
+            _prior = staticmethod(lambda x: x)
+
+            def __init__(self, name):
+                super().__init__(name)
+                self._sampler = None
+
+        missing_sampler_param = MissingSamplerParameter("test")
+        with self.assertRaises(AttributeError):
+            missing_sampler_param.sample()
+
+    def test_missing_ppf_not_implemented_error(self):
+        class MissingPPFParameter(Parameter):
+            _prior = staticmethod(lambda x: x)
+
+            def __init__(self, name):
+                super().__init__(name)
+                self.ppf = None
+
+        missing_ppf_param = MissingPPFParameter("test")
+        with self.assertRaises(NotImplementedError):
+            missing_ppf_param.get_ppf()
+
+    def test_2D_NormalPPF_error(self):
+        with self.assertRaises(NotImplementedError):
+            NormalPPF(0.0, 1.0, np.array([[1.0, 1.0], [1.0, 1.0]]))
 
 
 class TestParameter(unittest.TestCase):
@@ -37,6 +80,13 @@ class TestParameter(unittest.TestCase):
 
         msg3 = "Enterprise and scipy PPF do not match"
         assert np.allclose(UniformPPF(x, p_min, p_max), scipy.stats.uniform.ppf(x, p_min, p_max - p_min)), msg3
+
+        # As parameter dictionary or value for Uniform instantiated object
+        unipar = Uniform(pmin=p_min, pmax=p_max)("testpar")
+        assert np.allclose(
+            unipar.get_ppf(params=dict(testpar=x)), scipy.stats.uniform.ppf(x, p_min, p_max - p_min)
+        ), msg3
+        assert np.allclose(unipar.get_ppf(x), scipy.stats.uniform.ppf(x, p_min, p_max - p_min)), msg3
 
         # vector argument
         x = np.array([0.5, 0.1])
@@ -62,6 +112,33 @@ class TestParameter(unittest.TestCase):
         assert np.all((p_min < x1) & (x1 < p_max)), msg2
         assert x1.shape == (3, 2), msg2
 
+    def test_userparameter(self):
+        """Test User-defined parameter prior, sampler, and ppf"""
+
+        # scalar
+        p_min, p_max = 0.2, 1.1
+        x = 0.5
+
+        # As parameter dictionary or value for Uniform instantiated object
+        unipar = Uniform(pmin=p_min, pmax=p_max)("testpar")
+        unipar = UserParameter(
+            prior=Function(UniformPrior, pmin=p_min, pmax=p_max),
+            sampler=staticmethod(UniformSampler),
+            ppf=Function(UniformPPF, pmin=p_min, pmax=p_max),
+        )("testpar")
+
+        msg1 = "Enterprise and scipy prior do not match"
+        assert np.allclose(
+            unipar.get_pdf(params=dict(testpar=x)), scipy.stats.uniform.pdf(x, p_min, p_max - p_min)
+        ), msg1
+        assert np.allclose(unipar.get_pdf(x), scipy.stats.uniform.pdf(x, p_min, p_max - p_min)), msg1
+
+        msg2 = "Enterprise and scipy PPF do not match"
+        assert np.allclose(
+            unipar.get_ppf(params=dict(testpar=x)), scipy.stats.uniform.ppf(x, p_min, p_max - p_min)
+        ), msg2
+        assert np.allclose(unipar.get_ppf(x), scipy.stats.uniform.ppf(x, p_min, p_max - p_min)), msg2
+
     def test_linearexp(self):
         """Test LinearExp parameter prior and sampler."""
 
@@ -80,6 +157,13 @@ class TestParameter(unittest.TestCase):
         assert np.allclose(
             LinearExpPPF(x, p_min, p_max), np.log10(10**p_min + x * (10**p_max - 10**p_min))
         ), msg1c
+
+        # As parameter dictionary or value for Uniform instantiated object
+        lepar = LinearExp(pmin=p_min, pmax=p_max)("testpar")
+        assert np.allclose(
+            lepar.get_ppf(params=dict(testpar=x)), np.log10(10**p_min + x * (10**p_max - 10**p_min))
+        ), msg1
+        assert np.allclose(lepar.get_ppf(x), np.log10(10**p_min + x * (10**p_max - 10**p_min))), msg1
 
         # vector argument
         x = np.array([0, 1.5, 2.5])
@@ -232,4 +316,4 @@ class TestParameter(unittest.TestCase):
 
         paramA = TruncNormal(mu, sigma, pmin, pmax)("A")
         xs = np.array([-3.5, 3.5])
-        assert np.alltrue(paramA.get_pdf(xs, mu=mu.sample()) == zeros), msg4
+        assert np.all(paramA.get_pdf(xs, mu=mu.sample()) == zeros), msg4
