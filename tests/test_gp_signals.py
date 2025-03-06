@@ -8,16 +8,17 @@ test_gp_signals
 Tests for GP signal modules.
 """
 
-
 import unittest
+import pytest
 
 import numpy as np
 import scipy.linalg as sl
 
 from enterprise.pulsar import Pulsar
-from enterprise.signals import gp_signals, parameter, selections, signal_base, utils
+from enterprise.signals import gp_signals, parameter, selections, signal_base, utils, white_signals
 from enterprise.signals.selections import Selection
 from tests.enterprise_test_data import datadir
+from tests.enterprise_test_data import LIBSTEMPO_INSTALLED, PINT_INSTALLED
 
 
 @signal_base.function
@@ -35,13 +36,30 @@ def se_kernel(etoas, log10_sigma=-7, log10_lam=np.log10(30 * 86400)):
     return 10 ** (2 * log10_sigma) * np.exp(-(tm**2) / 2 / 10 ** (2 * log10_lam)) + d
 
 
+@signal_base.function
+def psd_matern32(f, length_scale=365 * 86400.0, log10_sigma_sqr=-14, components=2):
+    df = np.diff(np.concatenate((np.array([0]), f[::components])))
+    return (
+        (10**log10_sigma_sqr)
+        * 24
+        * np.sqrt(3)
+        * length_scale
+        / (3 + (2 * np.pi * f * length_scale) ** 2) ** 2
+        * np.repeat(df, components)
+    )
+
+
+def matern32_kernel(tau, length_scale=365 * 86400.0, log10_sigma_sqr=-14):
+    return (10**log10_sigma_sqr) * (1 + np.sqrt(3) * tau / length_scale) * np.exp(-np.sqrt(3) * tau / length_scale)
+
+
 class TestGPSignals(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         """Setup the Pulsar object."""
 
         # initialize Pulsar class
-        cls.psr = Pulsar(datadir + "/B1855+09_NANOGrav_9yv1.gls.par", datadir + "/B1855+09_NANOGrav_9yv1.tim")
+        cls.psr = Pulsar(datadir + "/B1855+09_NANOGrav_9yv1.t2.feather")
 
     def test_ecorr(self):
         """Test that ecorr signal returns correct values."""
@@ -354,6 +372,81 @@ class TestGPSignals(unittest.TestCase):
         msg = "F matrix shape incorrect"
         assert rnm.get_basis(params).shape == F.shape, msg
 
+    def test_fft_red_noise(self):
+        """Test the FFT implementation of red noise signals"""
+        # set up signal parameter
+        mpsd = psd_matern32(
+            length_scale=parameter.Uniform(365 * 86400.0, 3650 * 86400.0), log10_sigma_sqr=parameter.Uniform(-17, -9)
+        )
+        rn_cb0 = gp_signals.FFTBasisGP(spectrum=mpsd, components=15, oversample=3, cutbins=0)
+        rn_cb1 = gp_signals.FFTBasisGP(spectrum=mpsd, nknots=31, oversample=3, cutoff=3)
+        rnm0 = rn_cb0(self.psr)
+        rnm1 = rn_cb1(self.psr)
+
+        # parameter values
+        length_scale, log10_sigma_sqr = 1.5 * 365 * 86400.0, -14.0
+        params = {
+            "B1855+09_red_noise_length_scale": length_scale,
+            "B1855+09_red_noise_log10_sigma_sqr": log10_sigma_sqr,
+        }
+
+        # basis matrix test
+        start_time = np.min(self.psr.toas)
+        Tspan = np.max(self.psr.toas) - start_time
+        B, tc = utils.create_fft_time_basis(self.psr.toas, nknots=31)
+        B1, _ = utils.create_fft_time_basis(self.psr.toas, nknots=31, Tspan=Tspan, start_time=start_time)
+
+        msg = "B matrix incorrect for GP FFT signal."
+        assert np.allclose(B, rnm0.get_basis(params)), msg
+        assert np.allclose(B1, rnm1.get_basis(params)), msg
+        assert np.allclose(np.sum(B, axis=1), np.ones(B.shape[0])), msg
+
+        # spectrum test
+        tau = np.abs(tc[:, None] - tc[None, :])
+        phi_K = matern32_kernel(tau, length_scale, log10_sigma_sqr)
+        phi_E = rnm0.get_phi(params)
+
+        msg = "Prior incorrect for GP FFT signal."
+        assert np.allclose(phi_K, phi_E), msg
+
+        # spectrum test with low-frequency cut-off
+        freqs = utils.knots_to_freqs(tc, oversample=3)
+        psd = psd_matern32(freqs[1:], length_scale=length_scale, log10_sigma_sqr=log10_sigma_sqr, components=1)
+        psd = np.concatenate([[0.0], psd])
+        phi_K = utils.psd2cov(tc, psd)
+        phi_E = rnm1.get_phi(params)
+
+        msg = f"Prior incorrect for GP FFT signal."
+        assert np.allclose(phi_K, phi_E), msg
+
+    def test_fft_common(self):
+        """Test the FFT implementation of common red noise signals"""
+        # set up signal parameters
+        log10_A, gamma = -14.5, 4.33
+        params = {"B1855+09_red_noise_log10_A": log10_A, "B1855+09_red_noise_gamma": gamma}
+        pl = utils.powerlaw(log10_A=parameter.Uniform(-18, -12), gamma=parameter.Uniform(1, 7))
+        orf = utils.hd_orf()
+
+        # set up the basis and the model
+        start_time = np.min(self.psr.toas)
+        Tspan = np.max(self.psr.toas) - start_time
+        mn = white_signals.MeasurementNoise(efac=parameter.Constant(1.0), selection=Selection(selections.no_selection))
+        crn = gp_signals.FFTBasisCommonGP(
+            pl, orf, nknots=31, name="gw", oversample=3, cutoff=3, Tspan=Tspan, start_time=start_time
+        )
+        model = mn + crn
+        pta = signal_base.PTA([model(psr) for psr in [self.psr, self.psr]])
+
+        # test the prior matrices, including ORF
+        phi_full = pta.get_phi(params)
+        phi_1 = phi_full[:31, :31]
+        phi_12 = phi_full[31:, :31]
+        phi_2 = phi_full[31:, 31:]
+
+        msg = f"Common mode FFT Prior not equal between pulsars."
+        assert np.allclose(phi_1, phi_2), msg
+        assert np.allclose(0.5 * phi_1, phi_12), msg
+
     def test_red_noise_add(self):
         """Test that red noise addition only returns independent columns."""
         # set up signals
@@ -382,7 +475,7 @@ class TestGPSignals(unittest.TestCase):
             (30, 30, 1.123 * Tmax, Tmax),
         ]
 
-        for (nf1, nf2, T1, T2) in tpars:
+        for nf1, nf2, T1, T2 in tpars:
 
             rn = gp_signals.FourierBasisGP(spectrum=pl, components=nf1, Tspan=T1)
             crn = gp_signals.FourierBasisGP(spectrum=cpl, components=nf2, Tspan=T2)
@@ -459,7 +552,7 @@ class TestGPSignals(unittest.TestCase):
             (30, 20, None, Tmax),
         ]
 
-        for (nf1, nf2, T1, T2) in tpars:
+        for nf1, nf2, T1, T2 in tpars:
 
             rn = gp_signals.FourierBasisGP(spectrum=pl, components=nf1, Tspan=T1, selection=selection)
             crn = gp_signals.FourierBasisGP(spectrum=cpl, components=nf2, Tspan=T2)
@@ -711,6 +804,7 @@ class TestGPSignals(unittest.TestCase):
         assert m.get_basis(params).shape == T.shape, msg
 
 
+@pytest.mark.skipif(not PINT_INSTALLED, reason="Skipping tests that require PINT because it isn't installed")
 class TestGPSignalsPint(TestGPSignals):
     @classmethod
     def setUpClass(cls):
@@ -723,6 +817,16 @@ class TestGPSignalsPint(TestGPSignals):
             ephem="DE430",
             timing_package="pint",
         )
+
+
+@pytest.mark.skipif(not LIBSTEMPO_INSTALLED, reason="Skipping tests that require libstempo because it isn't installed")
+class TestGPSignalsTempo2(TestGPSignals):
+    @classmethod
+    def setUpClass(cls):
+        """Setup the Pulsar object."""
+
+        # initialize Pulsar class
+        cls.psr = Pulsar(datadir + "/B1855+09_NANOGrav_9yv1.gls.par", datadir + "/B1855+09_NANOGrav_9yv1.tim")
 
 
 class TestGPSignalsMarginalizingNmat:

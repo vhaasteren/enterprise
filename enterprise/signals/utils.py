@@ -20,12 +20,15 @@ from enterprise import constants as const
 from enterprise import signals as sigs  # noqa: F401
 from enterprise.signals.gp_bases import (  # noqa: F401
     createfourierdesignmatrix_red,
+    create_fft_time_basis,
     createfourierdesignmatrix_dm,
+    create_fft_time_basis_dm,
     createfourierdesignmatrix_dm_tn,
     createfourierdesignmatrix_env,
     createfourierdesignmatrix_ephem,
     createfourierdesignmatrix_eph,
     createfourierdesignmatrix_chromatic,
+    create_fft_time_basis_chromatic,
     createfourierdesignmatrix_general,
 )
 from enterprise.signals.gp_priors import powerlaw, turnover  # noqa: F401
@@ -35,7 +38,7 @@ logger = logging.getLogger(__name__)
 
 
 class ConditionalGP:
-    def __init__(self, pta, phiinv_method="cliques"):
+    def __init__(self, pta, phiinv_method="cliques", tm_params=[], psr=None):
         """This class allows the computation of conditional means and
         random draws for all GP coefficients/realizations in a model,
         given a vector of hyperparameters. It currently requires combine=False
@@ -44,6 +47,8 @@ class ConditionalGP:
 
         self.pta = pta
         self.phiinv_method = phiinv_method
+        self.psr = psr
+        self.tm_params = tm_params
 
     def _make_conditional(self, params):
         TNrs = self.pta.get_TNr(params)
@@ -93,11 +98,26 @@ class ConditionalGP:
             for i, model in enumerate(self.pta.pulsarmodels):
                 for sig in model._signals:
                     if sig.signal_type in ["basis", "common basis"]:
+
                         sb = sig.get_basis(params=params)
                         nb = sb.shape[1]
 
                         if nb + ntot > len(b):
                             raise IndexError("Missing parameters! You need to set combine=False in your GPs.")
+
+                        if "timing_model" in sig.name and len(self.tm_params) > 0:
+                            if self.psr is None:
+                                raise ValueError("Need to input psr to get timing model param names")
+                            else:
+                                for tm_par in self.tm_params:
+
+                                    tm_idx = list(self.psr.fitpars).index(tm_par)
+                                    save_name = sig.name.split("_")[0] + "_" + tm_par
+
+                                    if gp:
+                                        pardict[save_name] = np.dot(sb[:, tm_idx], b[ntot + tm_idx])
+                                    else:
+                                        pardict[save_name + "_coefficients"] = b[ntot + tm_idx]
 
                         if gp:
                             pardict[sig.name] = np.dot(sb, b[ntot : nb + ntot])
@@ -822,6 +842,57 @@ def linear_interp_basis(toas, dt=30 * 86400):
     idx = M.sum(axis=0) != 0
 
     return M[:, idx], x[idx]
+
+
+def psd2cov(
+    t_knots,
+    psd,
+):
+    """
+    Convert a power spectral density function, defined by (freqs, psd), to a covariance matrix
+
+    :param t_knots: Timestamps of the coarse time grid
+    :param psd: values of the PSD at frequencies freqs (assumes *delta_f in psd)
+
+    :return covmat: Covariance matrix at coarse time grid
+    """
+
+    def toeplitz(c):
+        c = np.asarray(c)
+        n = len(c)
+        i = np.arange(n).reshape(-1, 1)
+        j = np.arange(n).reshape(1, -1)
+        return c[np.abs(i - j)]
+
+    def covmat(*args):
+        fullpsd = np.concatenate([psd, psd[-2:0:-1]])
+
+        Cfreq = np.fft.ifft(fullpsd, norm="backward")
+        Ctau = Cfreq.real * len(fullpsd) / 2
+
+        return toeplitz(Ctau[: len(t_knots)])
+
+    return covmat()
+
+
+def knots_to_freqs(t_knots, oversample=3):
+    """
+    Convert knots of coarse time grid to frequencies
+
+    :param t_knots: Timestamps of the coarse time grid
+    :param oversample: amount by which to over-sample the frequency grid
+
+    :return covmat: Covariance matrix at coarse time grid
+    """
+    nmodes = len(t_knots)
+    Tspan = np.max(t_knots) - np.min(t_knots)
+
+    if nmodes % 2 == 0:
+        raise ValueError("psd2cov number of nmodes must be odd.")
+
+    n_freqs = int((nmodes - 1) / 2 * oversample + 1)
+    fmax = (nmodes - 1) / Tspan / 2
+    return np.linspace(0, fmax, n_freqs)
 
 
 # overlap reduction functions
