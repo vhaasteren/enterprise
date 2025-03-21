@@ -97,34 +97,32 @@ class ConditionalGP:
             pardict, ntot = {}, 0
             for i, model in enumerate(self.pta.pulsarmodels):
                 for sig in model._signals:
-                    if sig.signal_type in ["basis", "common basis"]:
+                    if sig.signal_type not in ["basis", "common basis"]:
+                        continue
 
-                        sb = sig.get_basis(params=params)
-                        nb = sb.shape[1]
+                    sb = sig.get_basis(params=params)
+                    nb = sb.shape[1]
 
-                        if nb + ntot > len(b):
-                            raise IndexError("Missing parameters! You need to set combine=False in your GPs.")
+                    if nb + ntot > len(b):
+                        raise IndexError("Missing parameters! You need to set combine=False in your GPs.")
 
-                        if "timing_model" in sig.name and len(self.tm_params) > 0:
-                            if self.psr is None:
-                                raise ValueError("Need to input psr to get timing model param names")
-                            else:
-                                for tm_par in self.tm_params:
+                    if "timing_model" in sig.name and len(self.tm_params) > 0:
+                        if self.psr is None:
+                            raise ValueError("Need to input psr to get timing model param names")
 
-                                    tm_idx = list(self.psr.fitpars).index(tm_par)
-                                    save_name = sig.name.split("_")[0] + "_" + tm_par
+                        for tm_par in self.tm_params:
 
-                                    if gp:
-                                        pardict[save_name] = np.dot(sb[:, tm_idx], b[ntot + tm_idx])
-                                    else:
-                                        pardict[save_name + "_coefficients"] = b[ntot + tm_idx]
+                            tm_idx = list(self.psr.fitpars).index(tm_par)
+                            save_name = sig.name.split("_")[0] + "_" + tm_par
+                            key = save_name if gp else f"{save_name}_coefficients"
+                            pardict[key] = np.dot(sb[:, tm_idx], b[ntot + tm_idx]) if gp else b[ntot + tm_idx]
 
-                        if gp:
-                            pardict[sig.name] = np.dot(sb, b[ntot : nb + ntot])
-                        else:
-                            pardict[sig.name + "_coefficients"] = b[ntot : nb + ntot]
+                    if gp:
+                        pardict[sig.name] = np.dot(sb, b[ntot : nb + ntot])
+                    else:
+                        pardict[sig.name + "_coefficients"] = b[ntot : nb + ntot]
 
-                        ntot += nb
+                    ntot += nb
 
             ret.append(pardict)
 
@@ -853,6 +851,7 @@ def psd2cov(
 
     :param t_knots: Timestamps of the coarse time grid
     :param psd: values of the PSD at frequencies freqs (assumes *delta_f in psd)
+                so psd is assumed to be in units of [s^2]
 
     :return covmat: Covariance matrix at coarse time grid
     """
@@ -882,13 +881,14 @@ def knots_to_freqs(t_knots, oversample=3):
     :param t_knots: Timestamps of the coarse time grid
     :param oversample: amount by which to over-sample the frequency grid
 
-    :return covmat: Covariance matrix at coarse time grid
+    :return freqs: Frequencies, regularly sampled with
+                   delta-f = 1/(oversample*T), fmax=1/(2*delta_t_knots)
     """
     nmodes = len(t_knots)
     Tspan = np.max(t_knots) - np.min(t_knots)
 
     if nmodes % 2 == 0:
-        raise ValueError("psd2cov number of nmodes must be odd.")
+        raise ValueError("len(t_knots) must be odd.")
 
     n_freqs = int((nmodes - 1) / 2 * oversample + 1)
     fmax = (nmodes - 1) / Tspan / 2
