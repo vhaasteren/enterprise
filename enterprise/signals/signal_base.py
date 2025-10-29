@@ -1115,6 +1115,42 @@ class csc_matrix_alt(sps.csc_matrix):
         raise NotImplementedError("csc_matrix_alt does not implement sqrtsolve")
 
 
+class DenseMatrix(object):
+    """Container for full dense covariance matrices using a provided
+    Cholesky factor (lower-triangular). Supports solve and sqrtsolve interfaces.
+    """
+
+    def __init__(self, cholesky_factor):
+        self._L = cholesky_factor
+        self._has_sqrtsolve = True
+
+    def __add__(self, other):
+        if other == 0:
+            return self
+        raise NotImplementedError("DenseMatrix cannot be combined with other white signals")
+
+    def __radd__(self, other):
+        if other == 0:
+            return self
+        raise NotImplementedError("DenseMatrix cannot be combined with other white signals")
+
+    def solve(self, other, left_array=None, logdet=False):
+        cf = (self._L, True)
+        mult = sl.cho_solve(cf, other)
+        if left_array is not None:
+            mult = np.dot(left_array.T, mult)
+        if logdet:
+            logdet_val = 2 * np.sum(np.log(np.diag(self._L)))
+            return mult, float(logdet_val)
+        return mult
+
+    def sqrtsolve(self, other, left_array=None):
+        mult = sl.solve_triangular(self._L, other, lower=True)
+        if left_array is not None:
+            mult = np.dot(left_array.T, mult)
+        return mult
+
+
 class ndarray_alt(np.ndarray):
     """Sub-class of ``np.ndarray`` with custom ``solve`` method."""
 

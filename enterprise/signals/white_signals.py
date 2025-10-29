@@ -294,3 +294,38 @@ def EcorrKernelNoise(
             return (idxs, jvec)
 
     return EcorrKernelNoise
+
+
+def DataCovarianceNoise(name=""):
+    """Signal for custom data covariance with a provided Cholesky factor.
+
+    This signal does not support selections and cannot be combined with other white signals.
+    """
+
+    class DataCovarianceNoise(signal_base.Signal):
+        signal_type = "white noise"
+        signal_name = "data_covariance"
+        signal_id = "data_covariance_" + name if name else "data_covariance"
+
+        def __init__(self, psr):
+            super(DataCovarianceNoise, self).__init__(psr)
+            self.name = self.psrname + "_" + self.signal_id
+
+            if psr.L_cholesky is None:
+                raise ValueError(
+                    "Pulsar must have a Cholesky factor (set _L_cholesky attribute)"
+                )
+
+            self._psr = psr
+            self._params = {}
+
+        @property
+        def ndiag_params(self):
+            return []
+
+        @signal_base.cache_call("ndiag_params")
+        def get_ndiag(self, params):
+            L = self._psr.L_cholesky
+            return signal_base.DenseMatrix(L)
+
+    return DataCovarianceNoise

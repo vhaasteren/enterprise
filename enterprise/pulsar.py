@@ -13,6 +13,7 @@ from pyarrow import Table
 from io import StringIO
 
 import numpy as np
+import scipy.linalg as sl
 from ephem import Ecliptic, Equatorial
 from astropy.time import Time
 
@@ -172,6 +173,11 @@ class BasePulsar(object):
 
         self.sort_data()
 
+        # If present, apply mask to custom Cholesky factor (slice rows and columns)
+        if hasattr(self, "_L_cholesky") and self._L_cholesky is not None:
+            sel = np.where(mask)[0]
+            self._L_cholesky = self._L_cholesky[np.ix_(sel, sel)]
+
     def to_feather(self, filename, noisedict=None):
         FeatherPulsar.save_feather(self, filename, noisedict=noisedict)
 
@@ -223,8 +229,31 @@ class BasePulsar(object):
         return self._residuals[self._isort]
 
     @property
+    def L_cholesky(self):
+        """Return lower-triangular Cholesky factor for current data order."""
+        if not hasattr(self, "_L_cholesky") or self._L_cholesky is None:
+            return None
+
+        # Determine if sorting is needed
+        if not isinstance(self._isort, slice):
+            is_identity = len(self._isort) == len(self._toas) and np.array_equal(
+                self._isort, np.arange(len(self._toas))
+            )
+            if not is_identity:
+                # Data is sorted - reorder covariance and recompute Cholesky
+                C = self._L_cholesky @ self._L_cholesky.T
+                C_sorted = C[np.ix_(self._isort, self._isort)]
+                return sl.cholesky(C_sorted, lower=True)
+
+        # No sorting needed (either slice or identity permutation)
+        return self._L_cholesky
+
+    @property
     def toaerrs(self):
         """Return array of TOA errors in seconds."""
+        if hasattr(self, "_L_cholesky") and self._L_cholesky is not None:
+            diag = np.sqrt(np.sum(self._L_cholesky**2, axis=1))
+            return diag[self._isort]
         return self._toaerrs[self._isort]
 
     @property
@@ -676,6 +705,7 @@ class Tempo2Pulsar(BasePulsar):
 class FeatherPulsar:
     columns = ["toas", "stoas", "toaerrs", "residuals", "freqs", "backend_flags", "telescope"]
     vector_columns = ["Mmat", "sunssb", "pos_t"]
+    matrix_columns = ["L_cholesky"]
     tensor_columns = ["planetssb"]
     # flags are done separately
     metadata = ["name", "dm", "dmx", "pdist", "pos", "phi", "theta", "fitpars", "setpars", "_pdist"]
@@ -709,6 +739,13 @@ class FeatherPulsar:
         for array in FeatherPulsar.vector_columns:
             cols = [c for c in f.column_names if c.startswith(array)]
             setattr(self, array, np.array([f[col].to_numpy() for col in cols]).swapaxes(0, 1).copy())
+
+        for array in FeatherPulsar.matrix_columns:
+            cols = [c for c in f.column_names if c.startswith(array + "_")]
+            if cols:
+                indices = sorted([int(c.split("_")[-1]) for c in cols])
+                matrix_data = np.array([f[f"{array}_{i}"].to_numpy() for i in indices])
+                setattr(self, array, matrix_data.T)
 
         for array in FeatherPulsar.tensor_columns:
             rows = sorted(set(["_".join(c.split("_")[:-1]) for c in f.column_names if c.startswith(array)]))
@@ -749,6 +786,16 @@ class FeatherPulsar:
                 f"{array}_{i}": getattr(self, array)[:, i]
                 for array in FeatherPulsar.vector_columns
                 for i in range(getattr(self, array).shape[1])
+            }
+        )
+
+        pydict.update(
+            {
+                f"{array}_{j}": matrix[:, j]
+                for array in FeatherPulsar.matrix_columns
+                for matrix in [getattr(self, array, None)]
+                if matrix is not None
+                for j in range(matrix.shape[1])
             }
         )
 
