@@ -185,6 +185,10 @@ class CommonSignal(Signal):
 def LogLikelihoodDenseCholesky(pta):
     return LogLikelihood(pta, cholesky_sparse=False)
 
+def TransformedLogLikelihood(pta, transform="Lw"):
+    _validate_likelihood_transform(transform)
+    return LogLikelihood(pta, cholesky_sparse=True, transform=transform)
+
 
 class LogLikelihood(object):
     def __init__(self, pta, cholesky_sparse=True, transform="native"):
@@ -304,6 +308,284 @@ class LogLikelihood(object):
             return loglike + loglike_remainder
         else:
             return loglike, loglike_remainder
+
+
+class SchurLogLikelihood(object):
+    """Log-likelihood using Schur complement decomposition."""
+
+    def __init__(self, pta):
+        self.pta = pta
+        self._validated_dense_split = False
+
+    def _validate_dense_split(self, params):
+        """Disallow Schur split-through for dense per-signal coefficient priors.
+
+        If a single signal contributes basis columns on both sides of the
+        common/pulsar split and that signal has a dense phi block, then the
+        current Schur implementation drops the common<->pulsar prior coupling.
+        """
+        if self._validated_dense_split:
+            return
+
+        for sc in self.pta._signalcollections:
+            if not sc._idx:
+                continue
+
+            common_cols = set(np.asarray(sc._common_idx, dtype=int).tolist())
+            pulsar_cols = set(np.asarray(sc._pulsar_idx, dtype=int).tolist())
+
+            if not common_cols or not pulsar_cols:
+                continue
+
+            for signal, cols in sc._idx.items():
+                colset = set(np.asarray(cols, dtype=int).tolist())
+                if not colset:
+                    continue
+
+                split_across_boundary = (colset & common_cols) and (colset & pulsar_cols)
+                if not split_across_boundary:
+                    continue
+
+                phi_signal = signal.get_phi(params)
+                if phi_signal is None:
+                    continue
+
+                if np.ndim(phi_signal) == 2:
+                    raise NotImplementedError(
+                        "SchurLogLikelihood does not support combine=True "
+                        "partial-overlap splits for dense phi signals. "
+                        "Signal '{}' in pulsar '{}' has basis columns on "
+                        "both common and pulsar-only sides.".format(signal.signal_id, sc.psrname)
+                    )
+
+        self._validated_dense_split = True
+
+    @staticmethod
+    def _build_L_B(Binv_p, n_p):
+        if Binv_p is None:
+            return np.zeros((n_p, n_p))
+        if np.ndim(Binv_p) == 1:
+            return np.diag(np.sqrt(np.maximum(np.asarray(Binv_p, dtype=float), 0.0)))
+        else:
+            return sl.cholesky(np.asarray(Binv_p), lower=False)
+
+    def __call__(self, xs, phiinv_method=None):
+        params = xs if isinstance(xs, dict) else self.pta.map_params(xs)
+        self._validate_dense_split(params)
+
+        logdetW_total = 0.0
+        for rl in self.pta.get_rNr_logdet(params):
+            logdetW_total += sum(rl[1:])
+
+        ntot = sum(sc._residuals.size for sc in self.pta._signalcollections)
+        logprior = sum(self.pta.get_logsignalprior(params))
+
+        if not self.pta._commonsignals:
+            return self._fallback_no_common(params)
+
+        phi_common = self.pta.get_phi_common(params)
+
+        csclass = next(iter(self.pta._commonsignals.keys()))
+        csdict = self.pta._commonsignals[csclass]
+        common_sc_set = set(csdict.values())
+
+        z_list = []
+        R_list = []
+        Delta_list = []
+        q_perp_total = 0.0
+        logdetA_total = 0.0
+        logdetB_total = 0.0
+        m_offsets = []
+        m_sizes = []
+        block_sc_list = []
+
+        for sc in self.pta._signalcollections:
+            y = sc.get_detres_Lw(params)
+            G, R = sc.get_common_qr_Lw(params)
+
+            if G is None:
+                if sc in common_sc_set:
+                    raise NotImplementedError(
+                        "Common-signal pulsar '{}' has no common basis "
+                        "columns for current parameters.".format(sc.psrname)
+                    )
+
+                Tp = sc.get_basis_pulsar_only_Lw(params)
+                if Tp is not None:
+                    Binv_p, logdetB = sc.get_phiinv_pulsar_only(params, logdet=True)
+
+                    n_p = Tp.shape[1]
+                    L_B = self._build_L_B(Binv_p, n_p)
+                    M_aug = np.vstack([Tp, L_B])
+                    d_aug = np.concatenate([y, np.zeros(n_p)])
+
+                    try:
+                        Q_A, R_A = sl.qr(M_aug, mode="economic")
+                    except sl.LinAlgError:
+                        return -np.inf
+
+                    diag_R = np.abs(np.diag(R_A))
+                    if np.any(diag_R == 0.0):
+                        print("Zero diagonal element in R_A for pulsar '{}'. Returning -inf.".format(sc.psrname))
+                        return -np.inf
+
+                    c = Q_A.T @ d_aug
+                    x = sl.solve_triangular(R_A, c)
+                    residual = d_aug - M_aug @ x
+                    q_perp_total += np.dot(residual, residual)
+                    logdetA_total += 2.0 * np.sum(np.log(diag_R))
+                    logdetB_total += (logdetB if Binv_p is not None else 0.0)
+                else:
+                    q_perp_total += np.dot(y, y)
+                continue
+
+            m_i = G.shape[1]
+            m_offsets.append(sum(m_sizes))
+            m_sizes.append(m_i)
+            block_sc_list.append(sc)
+
+            y_G = G.T @ y
+            y_perp = y - G @ y_G
+
+            Tp = sc.get_basis_pulsar_only_Lw(params)
+
+            if Tp is not None:
+                T_G = G.T @ Tp
+                T_perp = Tp - G @ T_G
+
+                Binv_p, logdetB = sc.get_phiinv_pulsar_only(params, logdet=True)
+
+                n_p = T_perp.shape[1]
+                L_B = self._build_L_B(Binv_p, n_p)
+                M_aug = np.vstack([T_perp, L_B])
+                d_aug = np.concatenate([y_perp, np.zeros(n_p)])
+
+                try:
+                    Q_A, R_A = sl.qr(M_aug, mode="economic")
+                except sl.LinAlgError:
+                    print("QR decomposition failed for pulsar '{}'. Returning -inf.".format(sc.psrname))
+                    return -np.inf
+
+                diag_R = np.abs(np.diag(R_A))
+                if np.any(diag_R == 0.0):
+                    return -np.inf
+
+                c = Q_A.T @ d_aug
+                x = sl.solve_triangular(R_A, c)
+
+                residual = d_aug - M_aug @ x
+                q_perp_i = np.dot(residual, residual)
+                logdetA_i = 2.0 * np.sum(np.log(diag_R))
+
+                V = sl.solve_triangular(R_A, T_G.T, trans="T")
+                Delta_i = V.T @ V
+
+                z_i = y_G - T_G @ x
+
+                q_perp_total += q_perp_i
+                logdetA_total += logdetA_i
+                logdetB_total += (logdetB if Binv_p is not None else 0.0)
+            else:
+                z_i = y_G.copy()
+                Delta_i = np.zeros((m_i, m_i))
+                q_perp_total += np.dot(y_perp, y_perp)
+
+            z_list.append(z_i)
+            R_list.append(R)
+            Delta_list.append(Delta_i)
+
+        m_tot = sum(m_sizes)
+        if m_tot == 0:
+            loglike = -0.5 * (
+                q_perp_total + logdetA_total + logdetB_total + logdetW_total + ntot * np.log(2 * np.pi)
+            )
+            loglike += logprior
+            return loglike
+
+        Sigma = np.eye(m_tot)
+
+        for offset, m_i, Delta_i in zip(m_offsets, m_sizes, Delta_list):
+            sl_i = slice(offset, offset + m_i)
+            Sigma[sl_i, sl_i] += Delta_i
+
+        sc_to_block = {sc: bi for bi, sc in enumerate(block_sc_list)}
+
+        for i, (_, csc_i) in enumerate(csdict.items()):
+            if csc_i not in sc_to_block:
+                continue
+            bi = sc_to_block[csc_i]
+            sl_i = slice(m_offsets[bi], m_offsets[bi] + m_sizes[bi])
+            R_i = R_list[bi]
+
+            for j, (_, csc_j) in enumerate(csdict.items()):
+                if csc_j not in sc_to_block or j < i:
+                    continue
+
+                bj = sc_to_block[csc_j]
+                sl_j = slice(m_offsets[bj], m_offsets[bj] + m_sizes[bj])
+                R_j = R_list[bj]
+
+                Phi_ij = phi_common[i][j]
+                if Phi_ij.ndim == 1:
+                    block = (R_i * Phi_ij[np.newaxis, :]) @ R_j.T
+                else:
+                    block = R_i @ Phi_ij @ R_j.T
+
+                Sigma[sl_i, sl_j] += block
+                if i != j:
+                    Sigma[sl_j, sl_i] += block.T
+
+        try:
+            cfSigma = sl.cho_factor(Sigma)
+        except sl.LinAlgError:
+            print("Cholesky decomposition failed for Sigma. Returning -inf.")
+            return -np.inf
+
+        z = np.concatenate(z_list)
+        Sigma_inv_z = sl.cho_solve(cfSigma, z)
+        quadG = z @ Sigma_inv_z
+        logdetSigma = 2.0 * np.sum(np.log(np.diag(cfSigma[0])))
+
+        loglike = -0.5 * (
+            q_perp_total
+            + quadG
+            + logdetSigma
+            + logdetA_total
+            + logdetB_total
+            + logdetW_total
+            + ntot * np.log(2 * np.pi)
+        )
+        loglike += logprior
+
+        return loglike
+
+    def _fallback_no_common(self, params):
+        loglike = 0.0
+        loglike -= 0.5 * sum(sum(rl) for rl in self.pta.get_rNr_logdet(params))
+
+        ntot = sum(sc._residuals.size for sc in self.pta._signalcollections)
+        loglike -= 0.5 * ntot * np.log(2 * np.pi)
+
+        loglike += sum(self.pta.get_logsignalprior(params))
+
+        phiinvs = self.pta.get_phiinv(params, logdet=True, method="cliques")
+        TNrs = self.pta.get_TNr(params)
+        TNTs = self.pta.get_TNT(params)
+
+        for TNr, TNT, pl in zip(TNrs, TNTs, phiinvs):
+            if TNr is None:
+                continue
+            phiinv, logdet_phi = pl
+            Sigma = TNT + (np.diag(phiinv) if phiinv.ndim == 1 else phiinv)
+            try:
+                cf = sl.cho_factor(Sigma)
+                expval = sl.cho_solve(cf, TNr)
+            except sl.LinAlgError:
+                return -np.inf
+            logdet_sigma = np.sum(2 * np.log(np.diag(cf[0])))
+            loglike += 0.5 * (np.dot(TNr, expval) - logdet_sigma - logdet_phi)
+
+        return loglike
 
 
 class PTA(object):
@@ -556,7 +838,7 @@ class PTA(object):
                     phi_common[:, i, i] += phi_i[idx, idx]
 
                 # off-diagonal: cross-correlations with other pulsars
-                for j, (cs2, csc2) in enumerate(csdict.items()):
+                for j, (cs2, _) in enumerate(csdict.items()):
                     if j <= i:
                         continue
                     crossdiag = csclass.get_phicross(cs, cs2, params)
@@ -579,6 +861,51 @@ class PTA(object):
             return phi_common, ld
         else:
             return phi_common
+
+    def get_phi_common(self, params):
+        """Build common-signal Phi blocks with cross-pulsar correlations.
+
+        Returns list-of-lists phi_common where phi_common[i][j] is either:
+        - 1D ndarray (diagonal coefficients), or
+        - 2D ndarray (dense coefficient covariance).
+        Returns None if there are no common signals.
+        """
+        if not self._commonsignals:
+            return None
+
+        if len(self._commonsignals) > 1:
+            raise NotImplementedError(
+                "SchurLogLikelihood does not support multiple common "
+                "signal classes. Found {} classes.".format(len(self._commonsignals))
+            )
+
+        for csclass, csdict in self._commonsignals.items():
+            npsr = len(csdict)
+            phi_common = [[None for _ in range(npsr)] for _ in range(npsr)]
+
+            for i, (cs, csc) in enumerate(csdict.items()):
+                phi_i = csc.get_phi(params)
+                idx = csc._idx[cs]
+
+                if phi_i.ndim == 1:
+                    phi_common[i][i] = np.array(phi_i[idx])
+                else:
+                    phi_common[i][i] = np.array(phi_i[np.ix_(idx, idx)])
+
+                for j, (cs2, csc2) in enumerate(csdict.items()):
+                    if j <= i:
+                        continue
+                    phicross = csclass.get_phicross(cs, cs2, params)
+                    if phicross.ndim == 1:
+                        phi_common[i][j] = np.array(phicross)
+                        phi_common[j][i] = np.array(phicross)
+                    else:
+                        phi_common[i][j] = np.array(phicross)
+                        phi_common[j][i] = np.array(phicross)
+
+            return phi_common
+
+        return None
 
     def get_phiinv_sparse(self, params, logdet=False):
         phi = self.get_phi(params)
@@ -1294,6 +1621,67 @@ def SignalCollection(metasignals):  # noqa: C901
             return phi_p.inv(logdet)
 
         # --- end of split methods ---
+
+        @cache_call(["white_params", "delay_params"])
+        def get_detres_Lw(self, params):
+            """Whitened residual y = Lw^{-1} r."""
+            r = self.get_detres(params)
+            Nvec = self.get_ndiag(params)
+            if not hasattr(Nvec, "sqrtsolve"):
+                raise NotImplementedError(
+                    "{} does not support sqrtsolve needed by SchurLogLikelihood.".format(Nvec.__class__.__name__)
+                )
+            try:
+                return Nvec.sqrtsolve(r)
+            except NotImplementedError as exc:
+                raise NotImplementedError(
+                    "{} does not support sqrtsolve needed by SchurLogLikelihood.".format(Nvec.__class__.__name__)
+                ) from exc
+
+        @cache_call(["basis_params", "white_params"], limit=1)
+        def get_basis_common_Lw(self, params={}):
+            """Whitened common basis F = Lw^{-1} F'."""
+            Fc = self.get_basis_common(params)
+            if Fc is None:
+                return None
+            Nvec = self.get_ndiag(params)
+            if not hasattr(Nvec, "sqrtsolve"):
+                raise NotImplementedError(
+                    "{} does not support sqrtsolve needed by SchurLogLikelihood.".format(Nvec.__class__.__name__)
+                )
+            try:
+                return Nvec.sqrtsolve(Fc)
+            except NotImplementedError as exc:
+                raise NotImplementedError(
+                    "{} does not support sqrtsolve needed by SchurLogLikelihood.".format(Nvec.__class__.__name__)
+                ) from exc
+
+        @cache_call(["basis_params", "white_params"], limit=1)
+        def get_basis_pulsar_only_Lw(self, params={}):
+            """Whitened pulsar-only basis T = Lw^{-1} T'."""
+            Tp = self.get_basis_pulsar_only(params)
+            if Tp is None:
+                return None
+            Nvec = self.get_ndiag(params)
+            if not hasattr(Nvec, "sqrtsolve"):
+                raise NotImplementedError(
+                    "{} does not support sqrtsolve needed by SchurLogLikelihood.".format(Nvec.__class__.__name__)
+                )
+            try:
+                return Nvec.sqrtsolve(Tp)
+            except NotImplementedError as exc:
+                raise NotImplementedError(
+                    "{} does not support sqrtsolve needed by SchurLogLikelihood.".format(Nvec.__class__.__name__)
+                ) from exc
+
+        @cache_call(["basis_params", "white_params"], limit=1)
+        def get_common_qr_Lw(self, params={}):
+            """Thin QR of the whitened common basis F = G R."""
+            F = self.get_basis_common_Lw(params)
+            if F is None:
+                return None, None
+            G, R = sl.qr(F, mode="economic")
+            return G, R
 
         @cache_call(["white_params", "delay_params"])
         def get_rNr_logdet(self, params):
