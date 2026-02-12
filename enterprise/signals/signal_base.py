@@ -389,6 +389,32 @@ class PTA(object):
     def get_TNT(self, params):
         return [signalcollection.get_TNT(params) for signalcollection in self._signalcollections]
 
+    # split tensor quantities into common / pulsar-only parts
+
+    def get_TNr_common(self, params):
+        _ = self._commonsignals  # ensure injection of _common_signal_set
+        return [sc.get_TNr_common(params) for sc in self._signalcollections]
+
+    def get_TNr_pulsar_only(self, params):
+        _ = self._commonsignals
+        return [sc.get_TNr_pulsar_only(params) for sc in self._signalcollections]
+
+    def get_TNT_common(self, params):
+        _ = self._commonsignals
+        return [sc.get_TNT_common(params) for sc in self._signalcollections]
+
+    def get_TNT_pulsar_only(self, params):
+        _ = self._commonsignals
+        return [sc.get_TNT_pulsar_only(params) for sc in self._signalcollections]
+
+    def get_TNT_cross(self, params):
+        _ = self._commonsignals
+        return [sc.get_TNT_cross(params) for sc in self._signalcollections]
+
+    def get_phiinv_pulsar_only(self, params, logdet=False):
+        _ = self._commonsignals
+        return [sc.get_phiinv_pulsar_only(params, logdet=logdet) for sc in self._signalcollections]
+
     def get_rNr_logdet(self, params):
         return [signalcollection.get_rNr_logdet(params) for signalcollection in self._signalcollections]
 
@@ -460,6 +486,14 @@ class PTA(object):
             # drop common signals that appear only once
             self._cs = {csclass: csdict for csclass, csdict in commonsignals.items() if len(csdict) > 1}
 
+            # inject common signal identity into each SignalCollection
+            # so that per-pulsar split methods can identify common columns
+            for sc in self._signalcollections:
+                sc._common_signal_set = frozenset(
+                    sig for csdict in self._cs.values()
+                    for sig, csc in csdict.items() if csc is sc
+                )
+
         return self._cs
 
     # return a dictionary (indexed by SignalCollection) of Python slices
@@ -483,6 +517,68 @@ class PTA(object):
             return self.get_phiinv_sparse(params, logdet)
         else:
             raise NotImplementedError
+
+    def get_phiinv_common(self, params, logdet=False):
+        """Invert the common-signal Phi block with cross-pulsar correlations.
+
+        Uses partition approach: builds (nfreq, npsr, npsr) array from
+        per-pulsar phi diagonals and cross-correlations, then inverts
+        frequency-by-frequency.
+
+        Returns (phiinv_common, logdet) if logdet=True, else phiinv_common.
+        phiinv_common has shape (nfreq, npsr, npsr) where pulsar ordering
+        follows the order of pulsars in self._commonsignals.
+        Returns None (or (None, 0.0)) if there are no common signals.
+        """
+        if not self._commonsignals:
+            return (None, 0.0) if logdet else None
+
+        ld = 0.0
+
+        for csclass, csdict in self._commonsignals.items():
+            npsr = len(csdict)
+
+            # all signals in csdict share the same basis size
+            first_cs = next(iter(csdict.keys()))
+            first_csc = csdict[first_cs]
+            nfreq = len(first_csc._idx[first_cs])
+
+            phi_common = np.zeros((nfreq, npsr, npsr))
+
+            for i, (cs, csc) in enumerate(csdict.items()):
+                # diagonal: this pulsar's total phi at common-signal indices
+                # (includes contributions from all signals at those columns)
+                phi_i = csc.get_phi(params)
+                idx = csc._idx[cs]
+                if phi_i.ndim == 1:
+                    phi_common[:, i, i] += phi_i[idx]
+                else:
+                    phi_common[:, i, i] += phi_i[idx, idx]
+
+                # off-diagonal: cross-correlations with other pulsars
+                for j, (cs2, csc2) in enumerate(csdict.items()):
+                    if j <= i:
+                        continue
+                    crossdiag = csclass.get_phicross(cs, cs2, params)
+                    if crossdiag.ndim == 1:
+                        phi_common[:, i, j] += crossdiag
+                        phi_common[:, j, i] += crossdiag
+                    else:
+                        raise NotImplementedError(
+                            "get_phiinv_common does not support dense phi cross matrices."
+                        )
+
+            # invert frequency by frequency (each is npsr x npsr)
+            for k in range(nfreq):
+                cf = sl.cho_factor(phi_common[k])
+                if logdet:
+                    ld += np.sum(2 * np.log(np.diag(cf[0])))
+                phi_common[k] = sl.cho_solve(cf, np.eye(npsr))
+
+        if logdet:
+            return phi_common, ld
+        else:
+            return phi_common
 
     def get_phiinv_sparse(self, params, logdet=False):
         phi = self.get_phi(params)
@@ -989,8 +1085,50 @@ def SignalCollection(metasignals):  # noqa: C901
             if par in ("_idx", "_Fmat"):
                 self._idx, self._Fmat = self._combine_basis_columns(self._signals)
                 return getattr(self, par)
+            elif par in ("_common_idx", "_pulsar_idx"):
+                self._common_idx, self._pulsar_idx = self._compute_basis_split()
+                return getattr(self, par)
             else:
                 raise AttributeError("{} object has no attribute {}".format(self.__class__, par))
+
+        def _compute_basis_split(self):
+            """Partition basis column indices into common and pulsar-only.
+
+            Uses _common_signal_set (injected by PTA._commonsignals) if
+            available, otherwise falls back to isinstance(signal, CommonSignal).
+
+            A column is 'common' if any CommonSignal uses it. With
+            combine=True, this promotes shared columns from non-common
+            signals into the common set.
+            """
+            cs = getattr(self, '_common_signal_set', None)
+            if cs is None:
+                cs = frozenset(
+                    sig for sig in self._signals
+                    if isinstance(sig, CommonSignal)
+                    and not getattr(sig, "_coefficients", {})
+                )
+
+            # Column indices used by common signals, preserving frequency order
+            common_cols_set = set()
+            common_idx_ordered = []
+            for sig in self._signals:
+                if sig in cs and sig in self._idx:
+                    for col in self._idx[sig]:
+                        if col not in common_cols_set:
+                            common_cols_set.add(col)
+                            common_idx_ordered.append(col)
+
+            # Everything else is pulsar-only
+            all_cols = set()
+            for sig in self._signals:
+                if sig in self._idx:
+                    all_cols.update(self._idx[sig])
+
+            return (
+                np.array(common_idx_ordered, dtype=int),
+                np.array(sorted(all_cols - common_cols_set), dtype=int),
+            )
 
         @cache_call("white_params")
         def get_ndiag(self, params):
@@ -1054,6 +1192,108 @@ def SignalCollection(metasignals):  # noqa: C901
                 return None
             Nvec = self.get_ndiag(params)
             return Nvec.solve(T, left_array=T)
+
+        # --- split basis, TNr, TNT into common / pulsar-only parts ---
+
+        @cache_call("basis_params", limit=1)
+        def get_basis_common(self, params={}):
+            """Basis columns for common signals only."""
+            T = self.get_basis(params)
+            if T is None:
+                return None
+            ci = self._common_idx
+            return T[:, ci] if len(ci) > 0 else None
+
+        @cache_call("basis_params", limit=1)
+        def get_basis_pulsar_only(self, params={}):
+            """Basis columns for pulsar-only (non-common) signals."""
+            T = self.get_basis(params)
+            if T is None:
+                return None
+            pi = self._pulsar_idx
+            return T[:, pi] if len(pi) > 0 else None
+
+        @cache_call(["basis_params", "white_params", "delay_params"])
+        def get_TNr_common(self, params):
+            """T_c^T N^{-1} r for common-signal basis columns."""
+            TNr = self.get_TNr(params)
+            if TNr is None:
+                return None
+            ci = self._common_idx
+            return TNr[ci] if len(ci) > 0 else None
+
+        @cache_call(["basis_params", "white_params", "delay_params"])
+        def get_TNr_pulsar_only(self, params):
+            """T_p^T N^{-1} r for pulsar-only basis columns."""
+            TNr = self.get_TNr(params)
+            if TNr is None:
+                return None
+            pi = self._pulsar_idx
+            return TNr[pi] if len(pi) > 0 else None
+
+        @cache_call(["basis_params", "white_params"])
+        def get_TNT_common(self, params):
+            """T_c^T N^{-1} T_c for common-signal basis columns."""
+            TNT = self.get_TNT(params)
+            if TNT is None:
+                return None
+            ci = self._common_idx
+            return TNT[np.ix_(ci, ci)] if len(ci) > 0 else None
+
+        @cache_call(["basis_params", "white_params"])
+        def get_TNT_pulsar_only(self, params):
+            """T_p^T N^{-1} T_p for pulsar-only basis columns."""
+            TNT = self.get_TNT(params)
+            if TNT is None:
+                return None
+            pi = self._pulsar_idx
+            return TNT[np.ix_(pi, pi)] if len(pi) > 0 else None
+
+        @cache_call(["basis_params", "white_params"])
+        def get_TNT_cross(self, params):
+            """T_p^T N^{-1} T_c cross term between pulsar-only and common."""
+            TNT = self.get_TNT(params)
+            if TNT is None:
+                return None
+            ci, pi = self._common_idx, self._pulsar_idx
+            if len(ci) == 0 or len(pi) == 0:
+                return None
+            return TNT[np.ix_(pi, ci)]
+
+        def get_phi_common(self, params):
+            """Phi sub-block at common-signal columns."""
+            phi = self.get_phi(params)
+            if phi is None:
+                return None
+            ci = self._common_idx
+            if len(ci) == 0:
+                return None
+            if phi.ndim == 1:
+                return KernelMatrix(np.array(phi[ci]))
+            else:
+                return KernelMatrix(np.array(phi[np.ix_(ci, ci)]))
+
+        def get_phi_pulsar_only(self, params):
+            """Phi sub-block at pulsar-only columns."""
+            phi = self.get_phi(params)
+            if phi is None:
+                return None
+            pi = self._pulsar_idx
+            if len(pi) == 0:
+                return None
+            if phi.ndim == 1:
+                return KernelMatrix(np.array(phi[pi]))
+            else:
+                return KernelMatrix(np.array(phi[np.ix_(pi, pi)]))
+
+        def get_phiinv_pulsar_only(self, params, logdet=False):
+            """Phi^{-1} for pulsar-only (non-common) signals."""
+            phi_p = self.get_phi_pulsar_only(params)
+            if phi_p is None:
+                return (None, 0.0) if logdet else None
+            return phi_p.inv(logdet)
+
+        # --- end of split methods ---
 
         @cache_call(["white_params", "delay_params"])
         def get_rNr_logdet(self, params):
