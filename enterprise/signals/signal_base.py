@@ -369,6 +369,81 @@ class SchurLogLikelihood(object):
         else:
             return sl.cholesky(np.asarray(Binv_p), lower=False)
 
+    @staticmethod
+    def _apply_qt_householder(qr_raw, tau, arr):
+        """Apply Q^T to arr using raw Householder reflectors from QR."""
+        if arr.ndim == 1:
+            cmat = arr[:, np.newaxis]
+            squeeze = True
+        else:
+            cmat = arr
+            squeeze = False
+
+        ormqr = sl.lapack.get_lapack_funcs("ormqr", (qr_raw, cmat))
+
+        qtc, work, info = ormqr("L", "T", qr_raw, tau, cmat, lwork=-1, overwrite_c=0)
+        if info != 0:
+            raise np.linalg.LinAlgError("LAPACK ormqr workspace query failed (info={}).".format(info))
+
+        lwork = int(work[0].real)
+        qtc, work, info = ormqr("L", "T", qr_raw, tau, cmat, lwork=lwork, overwrite_c=0)
+        if info != 0:
+            raise np.linalg.LinAlgError("LAPACK ormqr failed (info={}).".format(info))
+
+        if squeeze:
+            return qtc[:, 0]
+        return qtc
+
+    @staticmethod
+    def _solve_augmented_rrqr(M_aug, d_aug, T_G=None, rtol=1e-12):
+        """Solve augmented least squares with rank-revealing QR.
+
+        Uses column-pivoted QR and truncates numerically null directions.
+        When T_G is provided, computes Delta via the same truncated solve.
+        """
+        Q_A, R_A, piv = sl.qr(M_aug, mode="economic", pivoting=True)
+        c = Q_A.T @ d_aug
+
+        diag_R = np.abs(np.diag(R_A))
+        ncol = R_A.shape[1]
+
+        if diag_R.size == 0:
+            rank = 0
+            tol = 0.0
+        else:
+            tol = float(diag_R[0]) * float(rtol)
+            rank = int(np.sum(diag_R > tol))
+
+        x_perm = np.zeros(ncol)
+        logdetA = 0.0
+
+        if rank > 0:
+            R11 = R_A[:rank, :rank]
+            x_perm[:rank] = sl.solve_triangular(R11, c[:rank])
+            logdetA = 2.0 * np.sum(np.log(diag_R[:rank]))
+        else:
+            R11 = None
+
+        x = np.zeros(ncol)
+        x[piv] = x_perm
+
+        residual = d_aug - M_aug @ x
+        q_perp = np.dot(residual, residual)
+
+        Delta = None
+        if T_G is not None:
+            m_i = T_G.shape[0]
+            if rank == 0:
+                Delta = np.zeros((m_i, m_i))
+            else:
+                B = T_G.T
+                Bp = B[piv, :]
+                V1 = sl.solve_triangular(R11, Bp[:rank, :], trans="T")
+                Delta = V1.T @ V1
+                Delta = 0.5 * (Delta + Delta.T)
+
+        return x, q_perp, logdetA, Delta
+
     def __call__(self, xs, phiinv_method=None):
         params = xs if isinstance(xs, dict) else self.pta.map_params(xs)
         self._validate_dense_split(params)
@@ -401,9 +476,9 @@ class SchurLogLikelihood(object):
 
         for sc in self.pta._signalcollections:
             y = sc.get_detres_Lw(params)
-            G, R = sc.get_common_qr_Lw(params)
+            qr_raw, tau, R = sc.get_common_qr_raw_Lw(params)
 
-            if G is None:
+            if qr_raw is None:
                 if sc in common_sc_set:
                     raise NotImplementedError(
                         "Common-signal pulsar '{}' has no common basis "
@@ -420,65 +495,44 @@ class SchurLogLikelihood(object):
                     d_aug = np.concatenate([y, np.zeros(n_p)])
 
                     try:
-                        Q_A, R_A = sl.qr(M_aug, mode="economic")
+                        _, q_perp_i, logdetA_i, _ = self._solve_augmented_rrqr(M_aug, d_aug)
                     except sl.LinAlgError:
                         return -np.inf
 
-                    diag_R = np.abs(np.diag(R_A))
-                    if np.any(diag_R == 0.0):
-                        print("Zero diagonal element in R_A for pulsar '{}'. Returning -inf.".format(sc.psrname))
-                        return -np.inf
-
-                    c = Q_A.T @ d_aug
-                    x = sl.solve_triangular(R_A, c)
-                    residual = d_aug - M_aug @ x
-                    q_perp_total += np.dot(residual, residual)
-                    logdetA_total += 2.0 * np.sum(np.log(diag_R))
+                    q_perp_total += q_perp_i
+                    logdetA_total += logdetA_i
                     logdetB_total += (logdetB if Binv_p is not None else 0.0)
                 else:
                     q_perp_total += np.dot(y, y)
                 continue
 
-            m_i = G.shape[1]
+            m_i = R.shape[0]
             m_offsets.append(sum(m_sizes))
             m_sizes.append(m_i)
             block_sc_list.append(sc)
 
-            y_G = G.T @ y
-            y_perp = y - G @ y_G
+            QTy = self._apply_qt_householder(qr_raw, tau, y)
+            y_G = QTy[:m_i]
+            y_H = QTy[m_i:]
 
             Tp = sc.get_basis_pulsar_only_Lw(params)
 
             if Tp is not None:
-                T_G = G.T @ Tp
-                T_perp = Tp - G @ T_G
+                QTT = self._apply_qt_householder(qr_raw, tau, Tp)
+                T_G = QTT[:m_i, :]
+                T_H = QTT[m_i:, :]
 
                 Binv_p, logdetB = sc.get_phiinv_pulsar_only(params, logdet=True)
 
-                n_p = T_perp.shape[1]
+                n_p = T_H.shape[1]
                 L_B = self._build_L_B(Binv_p, n_p)
-                M_aug = np.vstack([T_perp, L_B])
-                d_aug = np.concatenate([y_perp, np.zeros(n_p)])
+                M_aug = np.vstack([T_H, L_B])
+                d_aug = np.concatenate([y_H, np.zeros(n_p)])
 
                 try:
-                    Q_A, R_A = sl.qr(M_aug, mode="economic")
+                    x, q_perp_i, logdetA_i, Delta_i = self._solve_augmented_rrqr(M_aug, d_aug, T_G=T_G)
                 except sl.LinAlgError:
-                    print("QR decomposition failed for pulsar '{}'. Returning -inf.".format(sc.psrname))
                     return -np.inf
-
-                diag_R = np.abs(np.diag(R_A))
-                if np.any(diag_R == 0.0):
-                    return -np.inf
-
-                c = Q_A.T @ d_aug
-                x = sl.solve_triangular(R_A, c)
-
-                residual = d_aug - M_aug @ x
-                q_perp_i = np.dot(residual, residual)
-                logdetA_i = 2.0 * np.sum(np.log(diag_R))
-
-                V = sl.solve_triangular(R_A, T_G.T, trans="T")
-                Delta_i = V.T @ V
 
                 z_i = y_G - T_G @ x
 
@@ -488,7 +542,7 @@ class SchurLogLikelihood(object):
             else:
                 z_i = y_G.copy()
                 Delta_i = np.zeros((m_i, m_i))
-                q_perp_total += np.dot(y_perp, y_perp)
+                q_perp_total += np.dot(y_H, y_H)
 
             z_list.append(z_i)
             R_list.append(R)
@@ -1682,6 +1736,20 @@ def SignalCollection(metasignals):  # noqa: C901
                 return None, None
             G, R = sl.qr(F, mode="economic")
             return G, R
+
+        @cache_call(["basis_params", "white_params"], limit=1)
+        def get_common_qr_raw_Lw(self, params={}):
+            """Raw Householder QR of whitened common basis.
+
+            Returns (qr_raw, tau, R) for F = Q R. Returns (None, None, None)
+            if there is no common basis.
+            """
+            F = self.get_basis_common_Lw(params)
+            if F is None:
+                return None, None, None
+            qr_out = sl.qr(F, mode="raw")
+            (qr_raw, tau), R = qr_out
+            return qr_raw, tau, R
 
         @cache_call(["white_params", "delay_params"])
         def get_rNr_logdet(self, params):
